@@ -38,7 +38,7 @@ const packAndInstall = (packDir, installDir, callback) => {
 		const uniqueName = `pushkinComponent${uuid().split('-').join('')}`;
 		packageJson.name = uniqueName;
 		startTask();
-		fs.writeFile(packageJsonPath, JSON.stringify(packageJson), 'utf8', err => {
+		fs.writeFileSync(packageJsonPath, JSON.stringify(packageJson), 'utf8', err => {
 			if (err)
 				return fail('Failed to write new package.json', err);
 
