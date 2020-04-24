@@ -1,12 +1,12 @@
-## pushkin init site issue:
+# pushkin init site issue:
 
-# problem:
+## problem:
 `
 No container found for test_db_1
 Failed to run create database command in test_db container: 1
 `
 
-# potential solution:
+## potential solution:
 update `services: test_db` in `pushkin/docker-compose.dev.yml` to look like this:
 `
 test_db:
@@ -20,12 +20,12 @@ test_db:
 `
 
 
-## pushkin setupdb issue:
+# pushkin setupdb issue:
 
-# problems:
+## problems:
 `Error: connect ECONNREFUSED 127.0.01:5432`
 
-# potential solution:
+## potential solution:
 the connect error is probably because of the port conflicts, make sure the port 5432 is empty when start the quick start
 
 If not, maybe the PostgreSQL is not started or login/password for pg is not good, maybe because of the configuration errors in docker. The probelm in docker config file is still waited to be found.
