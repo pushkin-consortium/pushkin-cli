@@ -10,8 +10,9 @@ import { execSync, exec } from 'child_process'; // eslint-disable-line
 // subcommands
 import { listExpTemplates, getExpTemplate,  } from './commands/experiments/index.js';
 import { listSiteTemplates, getPushkinSite, pushkinInit } from './commands/sites/index.js';
+import { awsInit, nameProject, addIAM } from './commands/aws/index.js'
 import prep from './commands/prep/index.js';
-import setupdb from './commands/setupdb/index.js';
+import { setupdb, setupTestTransactionsDB } from './commands/setupdb/index.js';
 import * as compose from 'docker-compose'
 import { Command } from 'commander'
 import inquirer from 'inquirer'
@@ -93,14 +94,12 @@ const handlePrep = async () => {
 }
 
 const getVersions = async (url) => {
-  console.log(url)
   let response
   let body
   let verList = {}
   try {
     const response = await got(url);
     body = JSON.parse(response.body)
-    console.log(url)
     body.forEach((r) => {
       verList[r.tag_name] = r.url;
     })
@@ -123,7 +122,10 @@ const handleInstall = async (what) => {
           .then((verList) => {
             inquirer.prompt(
               [{ type: 'list', name: 'version', choices: Object.keys(verList), default: 0, message: 'Which version? (Recommend:'.concat(Object.keys(verList)[0]).concat(')')}]
-            ).then(answers => getPushkinSite(process.cwd(),verList[answers.version]))
+            ).then(async (answers) => {
+              await getPushkinSite(process.cwd(),verList[answers.version])
+              await setupTestTransactionsDB()
+            })
           })
         })
     } else {
@@ -156,6 +158,90 @@ const handleInstall = async (what) => {
   } catch(e) {
     throw e
   }
+}
+
+const inquirerPromise = async (type, name, message) => {
+  let answers = inquirer.prompt([ { type: 'input', name: 'name', message: 'Name your project'}])
+  return answers[name]
+}
+
+const handleAWSInit = async () => {
+  let temp
+
+  let config
+  try {
+    config = await loadConfig(path.join(process.cwd(), 'pushkin.yaml'))
+  } catch (e) {
+    console.error(`Unable to load pushkin.yaml`)
+    throw e
+  }
+
+  if (config.DockerHubID == null) {
+    console.error(`Your DockerHub ID has not been configured. Please be sure you have a valid DockerHub ID and then run 'pushkin setDockerHub'.`)
+    process.exit()
+  }
+  
+  let projName;
+  let useIAM;
+  let awsName
+  let stdOut
+
+  try {
+    execSync('aws --version')
+  } catch(e) {
+    console.error('Please install the AWS CLI before continuing.')
+    process.exit();
+  }
+
+  let newProj = true
+  if (config.info.projName) {
+    try {
+      projName = await inquirer.prompt([ { type: 'list', name: 'name', choices: [config.info.projName, 'new'], message: 'Which project?'}])
+    } catch (e) {
+      throw e
+    }
+    if (projName.name != "new") {
+      newProj = false;
+      awsName = config.info.awsName
+    }
+  }
+
+  if (newProj) {
+    try {
+      projName = await inquirer.prompt([ { type: 'input', name: 'name', message: 'Name your project'}])
+      awsName = await nameProject(projName.name)
+    } catch(e) {
+      console.error(e)
+      process.exit()
+    }
+  }
+  try {
+    useIAM = await inquirer.prompt([{ type: 'input', name: 'iam', message: 'Provide your AWS IAM username that you want to use for managing this project.'}])
+  } catch (e) {
+    console.error('Problem getting AWS IAM username.\n', e)
+    process.exit()
+  }
+  try {
+    stdOut = execSync(`aws configure list --profile ${useIAM.iam}`).toString()
+  } catch (e) {
+    console.error(`The IAM user ${useIAM.iam} is not configured on the AWS CLI. For more information see https://docs.aws.amazon.com/cli/latest/userguide/cli-chap-configure.html`)
+    process.exit();
+  }
+  let addedIAM
+  try {
+    addedIAM = addIAM(useIAM.iam) //this doesn't need to be synchronous      
+  } catch(e) {
+    console.error(e)
+    process.exit()
+  }
+  try {
+    await Promise.all([awsInit(projName.name, awsName, useIAM.iam, config.DockerHubID), addedIAM])
+  } catch(e) {
+    throw e
+  }
+  console.log("done")
+
+  return
 }
 
 const killLocal = async () => {
@@ -213,10 +299,55 @@ async function main() {
     });
 
   program
+    .command('aws <cmd>')
+    .description(`For working with AWS. Commands include:\n init: initialize an AWS deployment`)
+    .action(async (cmd) => {
+      moveToProjectRoot();
+      switch (cmd){
+        case 'init':
+          try {
+            await handleAWSInit();
+          } catch(e) {
+            console.error(e)
+            process.exit();
+          }
+          break;
+        default: 
+          console.error("Command not recognized. For help, run 'pushkin help aws'.")
+      }
+    });
+
+  program
     .command('init')
     .description(`Primarily for development. Don't use.`)
     .action(() => {
       pushkinInit();
+    })
+
+  program
+    .command('setDockerHub')
+    .description(`Set (or change) your DockerHub ID. This must be run before deploying to AWS.`)
+    .action(() => {
+      moveToProjectRoot();
+      inquirer.prompt([
+          { type: 'input', name: 'ID', message: 'What is your DockerHub ID?'}
+        ]).then(async (answers) => {
+          let config
+          try {
+            config = await loadConfig(path.join(process.cwd(), 'pushkin.yaml'));
+          } catch(e) {
+            console.error(e)
+            process.exit();
+          }
+          config.DockerHubID = answers.ID;
+          try {
+            fs.writeFileSync(path.join(process.cwd(), 'pushkin.yaml'), jsYaml.safeDump(config))
+          } catch (e) {
+            console.error('Unable to rewrite pushkin.yaml.')
+            console.error(e)
+            process.exit()
+          }
+        })
     })
 
   program
@@ -300,6 +431,13 @@ async function main() {
     .command('kill')
     .description('Removes all containers and volumes from local Docker, as well as pushkin-specific images. To additionally remove third-party images, run `pushkin armageddon`.')
     .action(killLocal)
+
+  program
+    .command('setup-transaction-db')
+    .description('This is included for backwards compatibility. You probably will not need. Creates a local transactions db.')
+    .action(async () => {
+      await setupTestTransactionsDB()
+    })
 
   program
     .command('armageddon')
