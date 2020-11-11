@@ -9,9 +9,10 @@ import 'regenerator-runtime/runtime';
 import { execSync, exec } from 'child_process'; // eslint-disable-line
 // subcommands
 import { listExpTemplates, getExpTemplate,  } from './commands/experiments/index.js';
-import { listSiteTemplates, getPushkinSite, pushkinInit } from './commands/sites/index.js';
-import prep from './commands/prep/index.js';
-import setupdb from './commands/setupdb/index.js';
+import { listSiteTemplates, getPushkinSite } from './commands/sites/index.js';
+import { awsInit, nameProject, addIAM, awsArmageddon, awsList } from './commands/aws/index.js'
+import { prep, setEnv } from './commands/prep/index.js';
+import { setupdb, setupTestTransactionsDB } from './commands/setupdb/index.js';
 import * as compose from 'docker-compose'
 import { Command } from 'commander'
 import inquirer from 'inquirer'
@@ -92,15 +93,58 @@ const handlePrep = async () => {
   return;  
 }
 
+const handleAWSList = async () => {
+  let useIAM
+  try {
+    useIAM = await inquirer.prompt([{ type: 'input', name: 'iam', message: 'Provide your AWS profile username that you want to use for managing this project.'}])
+  } catch (e) {
+    console.error('Problem getting AWS IAM username.\n', e)
+    process.exit()
+  }
+  return awsList(useIAM.iam)
+}
+
+const handleAWSArmageddon = async () => {
+  let nukeMe
+  try {
+    nukeMe = await inquirer.prompt([{ type: 'input', name: 'armageddon', message: `This command will DELETE your website. This cannot be undone.\n Are you SURE you want to do this?\n Confirm by typing 'armageddon'.`}])
+  } catch (e) {
+    console.error('Problem getting permission.\n', e)
+    process.exit()
+  }
+  if (nukeMe.armageddon != 'armageddon') {
+    console.log('That is probably wise. Exiting.')
+    return
+  }
+  let nukeMeTwice
+  try {
+    nukeMeTwice = await inquirer.prompt([{ type: 'input', name: 'armageddon', message: `Your database -- along with any data -- will be deleted.\n Confirm this is what you want by typing 'nuke my data'.`}])
+  } catch (e) {
+    console.error('Problem getting permission.\n', e)
+    process.exit()
+  }
+  if (nukeMeTwice.armageddon != 'nuke my data') {
+    console.log('That is probably wise. Exiting.')
+    return
+  }
+  console.log(`I hope you know what you are doing. This makes me nervous every time...`)
+  let useIAM
+  try {
+    useIAM = await inquirer.prompt([{ type: 'input', name: 'iam', message: 'Provide your AWS profile username that you want to use for managing this project.'}])
+  } catch (e) {
+    console.error('Problem getting AWS IAM username.\n', e)
+    process.exit()
+  }
+  return awsArmageddon(useIAM.iam)
+}
+
 const getVersions = async (url) => {
-  console.log(url)
   let response
   let body
   let verList = {}
   try {
     const response = await got(url);
     body = JSON.parse(response.body)
-    console.log(url)
     body.forEach((r) => {
       verList[r.tag_name] = r.url;
     })
@@ -123,7 +167,10 @@ const handleInstall = async (what) => {
           .then((verList) => {
             inquirer.prompt(
               [{ type: 'list', name: 'version', choices: Object.keys(verList), default: 0, message: 'Which version? (Recommend:'.concat(Object.keys(verList)[0]).concat(')')}]
-            ).then(answers => getPushkinSite(process.cwd(),verList[answers.version]))
+            ).then(async (answers) => {
+              await getPushkinSite(process.cwd(),verList[answers.version])
+//              await setupTestTransactionsDB()
+            })
           })
         })
     } else {
@@ -158,6 +205,117 @@ const handleInstall = async (what) => {
   }
 }
 
+const inquirerPromise = async (type, name, message) => {
+  let answers = inquirer.prompt([ { type: 'input', name: 'name', message: 'Name your project'}])
+  return answers[name]
+}
+
+const handleAWSInit = async (force) => {
+  let temp
+
+  try {
+    execSync(`docker login`)
+  } catch (e) {
+    console.error(`Please log into DockerHub before continuing.\n Type '$ docker login' into the console.\n Provide your username and password when asked.`)
+    process.exit()
+  }
+
+  try {
+    console.log(`Setting front-end 'environment variable'`)
+    setEnv(false)
+  } catch (e) {
+    console.error(`Unable to create .env.js`)
+    throw e
+  }
+
+  let config
+  try {
+    config = await loadConfig(path.join(process.cwd(), 'pushkin.yaml'))
+  } catch (e) {
+    console.error(`Unable to load pushkin.yaml`)
+    throw e
+  }
+
+  if (config.DockerHubID == '') {
+    console.error(`Your DockerHub ID has not been configured. Please be sure you have a valid DockerHub ID and then run 'pushkin setDockerHub'.`)
+    process.exit()
+  }
+  
+  let projName, useIAM, awsName, stdOut
+
+  try {
+    execSync('aws --version')
+  } catch(e) {
+    console.error('Please install the AWS CLI before continuing.')
+    process.exit();
+  }
+
+  let newProj = true
+  if (config.info.projName) {
+    let myChoices = (config.info.projName ? [config.info.projName, 'new'] : ['new'])
+    try {
+      projName = await inquirer.prompt([ { type: 'list', name: 'name', choices: myChoices, message: 'Which project?'}])
+    } catch (e) {
+      throw e
+    }
+    if (projName.name != "new") {
+      newProj = false;
+      awsName = config.info.awsName
+    }
+    if (force) {
+      try {
+        //Run this anyway to reset awsResources.js and remove productionDBs from pushkin.yaml
+        awsName = await nameProject(projName.name)
+      } catch (e) {
+        throw e
+      }
+    }
+  }
+
+  if (newProj) {
+    try {
+      projName = await inquirer.prompt([ { type: 'input', name: 'name', message: 'Name your project'}])
+    } catch(e) {
+      console.error(e)
+      process.exit()
+    }
+    try {
+        awsName = await nameProject(projName.name)    
+    } catch (e) {
+      throw e
+    }
+  }
+
+
+  try {
+    useIAM = await inquirer.prompt([{ type: 'input', name: 'iam', message: 'Provide your AWS profile username that you want to use for managing this project.'}])
+  } catch (e) {
+    console.error('Problem getting AWS IAM username.\n', e)
+    process.exit()
+  }
+  try {
+    stdOut = execSync(`aws configure list --profile ${useIAM.iam}`).toString()
+  } catch (e) {
+    console.error(`The IAM user ${useIAM.iam} is not configured on the AWS CLI. For more information see https://docs.aws.amazon.com/cli/latest/userguide/cli-chap-configure.html`)
+    process.exit();
+  }
+  let addedIAM
+  try {
+    addedIAM = addIAM(useIAM.iam) //this doesn't need to be synchronous      
+  } catch(e) {
+    console.error(e)
+    process.exit()
+  }
+  try {
+    await Promise.all([awsInit(projName.name, awsName, useIAM.iam, config.DockerHubID), addedIAM])
+  } catch(e) {
+    throw e
+  }
+  console.log("done")
+
+  return
+}
+
 const killLocal = async () => {
   console.log('Removing all containers and volumes, as well as pushkin images. To additionally remove third-party images, run `pushkin armageddon`.') 
   moveToProjectRoot();
@@ -190,13 +348,6 @@ async function main() {
 //    .option('-p, --pizza-type <type>', 'flavour of pizza');
 
   program
-    .command('config [what]')
-    .description('View config file for `what`, with possible values being `site` or any of the installed experiments by name. Defaults to all.')
-    .action((what) => {
-      handleViewConfig(what)
-    });
-
-  program
     .command('install <what>')
     .description(`Install template website ('site') or experiment ('experiment').`)
     .action((what) => {
@@ -213,16 +364,69 @@ async function main() {
     });
 
   program
-    .command('init')
-    .description(`Primarily for development. Don't use.`)
-    .action(() => {
-      pushkinInit();
-    })
+    .command('aws <cmd>')
+    .description(`For working with AWS. Commands include:\n 
+      init: initialize an AWS deployment.\n 
+      armageddon: delete AWS resources created by Pushkin.\n
+      list: list AWS resources created by Pushkin (and possibly others).`)
+    .option('-f, --force', 'Applies only to init. Resets installation options. Does not delete AWS resources (for that, use aws armageddon).', false)
+    .action(async (cmd, options) => {
+      moveToProjectRoot();
+      switch (cmd){
+        case 'init':
+          try {
+            await handleAWSInit(options.force);
+          } catch(e) {
+            console.error(e)
+            process.exit();
+          }
+          break;
+        case 'armageddon':
+          try {
+            await handleAWSArmageddon();
+          } catch(e) {
+            console.error(e);
+            process.exit();
+          }
+          break;
+        case 'list':
+          try {
+            await handleAWSList();
+          } catch(e) {
+            console.error(e);
+            process.exit();
+          }
+          break;
+        default: 
+          console.error("Command not recognized. For help, run 'pushkin help aws'.")
+      }
+    });
 
   program
-    .command('updateDB')
-    .description('Updates test database. This is automatically run as part of `pushkin prep`, so you are unlikely to need to use it directly.')
-    .action(handleUpdateDB)
+    .command('setDockerHub')
+    .description(`Set (or change) your DockerHub ID. This must be run before deploying to AWS.`)
+    .action(() => {
+      moveToProjectRoot();
+      inquirer.prompt([
+          { type: 'input', name: 'ID', message: 'What is your DockerHub ID?'}
+        ]).then(async (answers) => {
+          let config
+          try {
+            config = await loadConfig(path.join(process.cwd(), 'pushkin.yaml'));
+          } catch(e) {
+            console.error(e)
+            process.exit();
+          }
+          config.DockerHubID = answers.ID;
+          try {
+            fs.writeFileSync(path.join(process.cwd(), 'pushkin.yaml'), jsYaml.safeDump(config))
+          } catch (e) {
+            console.error('Unable to rewrite pushkin.yaml.')
+            console.error(e)
+            process.exit()
+          }
+        })
+    })
 
   program
     .command('prep')
@@ -251,6 +455,12 @@ async function main() {
     .option('-nc, --nocache', 'Rebuild all images from scratch, without using the cache.', false)
     .action(async (options) => {
       moveToProjectRoot();
+      try {
+        console.log(`Setting front-end 'environment variable'`)
+        setEnv(true) //this is synchronous
+      } catch (e) {
+        console.error(`Unable to update .env.js`)
+      }
       try {
         fs.copyFileSync('pushkin/front-end/src/experiments.js', 'pushkin/front-end/experiments.js');
       } catch (e) {
@@ -312,6 +522,42 @@ async function main() {
       }
       return;
     })
+
+  program
+    .command('config [what]')
+    .description('View config file for `what`, with possible values being `site` or any of the installed experiments by name. Defaults to all.')
+    .action((what) => {
+      handleViewConfig(what)
+    });
+
+  program
+    .command('utils <cmd>')
+    .description(`Functions that are useful for backwards compatibility or debugging.\n
+      init: Updates test database. This is automatically run as part of 'pushkin prep'.\n
+      setup-transaction-db: Creates a local transactions db. Useful for users of old site templates who wish to use CLI v2+.`)
+    .action(async (cmd) => {
+      moveToProjectRoot();
+      switch (cmd){
+        case 'updateDB':
+          try {
+            await handleUpdateDB();
+          } catch(e) {
+            console.error(e)
+            process.exit();
+          }
+          break;
+        case 'setup-transaction-db':
+          try {
+            await setupTestTransactionsDB();
+          } catch(e) {
+            console.error(e);
+            process.exit();
+          }
+          break;
+        default: 
+          console.error("Command not recognized. For help, run 'pushkin help utils'.")
+      }
+    });
 
    program.parseAsync(process.argv);
 }
